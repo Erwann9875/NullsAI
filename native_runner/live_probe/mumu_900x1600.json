@@ -1,0 +1,17 @@
+{
+  "screen_width": 900,
+  "screen_height": 1600,
+  "arena_left": 75,
+  "arena_top": 160,
+  "arena_right": 825,
+  "arena_bottom": 1200,
+  "hand_y": 1425,
+  "hand_centers_x": [282, 451, 619, 787],
+  "owner_zero_at_screen_bottom": true,
+  "drag_min_ms": 260,
+  "drag_max_ms": 520,
+  "drag_ms_per_pixel": 0.35,
+  "hand_jitter_px": 5,
+  "release_jitter_px": 4,
+  "drag_duration_jitter_ms": 35
+}
