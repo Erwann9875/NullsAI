@@ -66,7 +66,7 @@ def main():
             probe_start=time.monotonic()
             quick=probe_start<deadline
             try:
-                client.arm(account_id(args.player_tag),quick=quick)
+                layout=client.arm(account_id(args.player_tag),quick=quick)
                 break
             except ExternalMemoryError as exc:
                 reason=str(exc)
@@ -79,7 +79,8 @@ def main():
                 time.sleep(min(.2,max(0.,deadline-time.monotonic())))
         armed_at = time.monotonic()
         log('armed', attach_ms=round((armed_at-probe_start)*1000,1),
-            wait_before_lookup_ms=round((probe_start-attach_start)*1000,1), source=client.reader.discovery_source)
+            wait_before_lookup_ms=round((probe_start-attach_start)*1000,1), source=client.reader.discovery_source,
+            native_local_owner=layout.native_local_owner)
         cursor=0
         previous=-1
         generation=None

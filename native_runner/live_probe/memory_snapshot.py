@@ -6,6 +6,7 @@ from typing import Mapping, Sequence
 
 from .memory_types import (
     ARENA_NATIVE_HEIGHT,
+    ARENA_NATIVE_WIDTH,
     MANAGER_TICK,
     MANAGER_WORLD,
     MAX_COMPONENTS,
@@ -167,9 +168,12 @@ class BattleSnapshotMixin:
 
     @staticmethod
     def _normalize_objects(layout: BattleLayout, objects: Sequence[Mapping[str, object]]) -> list[dict[str, object]]:
-
+        # In seat zero, increasing native x runs toward screen left.
         if layout.native_local_owner == 0:
-            return [dict(item) for item in objects]
+            return [
+                dict(item, x=ARENA_NATIVE_WIDTH - int(item["x"]), targetX=ARENA_NATIVE_WIDTH - int(item["targetX"]))
+                for item in objects
+            ]
         normalized: list[dict[str, object]] = []
         for item in objects:
             value = dict(item)

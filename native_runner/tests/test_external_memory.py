@@ -93,6 +93,24 @@ class _Memory:
         return [self.payloads[address][:size] for address, size in ranges]
 
 
+@pytest.mark.parametrize(
+    ("local_owner", "position", "target", "tower"),
+    [
+        (0, (5499, 12500), (3500, 6500), (14500, 6500)),
+        (1, (12501, 19500), (14500, 25500), (3500, 25500)),
+    ],
+)
+def test_both_seats_map_to_the_same_screen_tiles(local_owner, position, target, tower):
+    troop = dict(owner=local_owner, x=position[0], y=position[1], targetX=target[0], targetY=target[1])
+    princess = dict(owner=local_owner, x=tower[0], y=tower[1], targetX=tower[0], targetY=tower[1])
+    defender, left_tower = ExternalBattleReader._normalize_objects(
+        SimpleNamespace(native_local_owner=local_owner), [troop, princess]
+    )
+    assert (defender["owner"], defender["x"], defender["y"]) == (0, 12501, 12500)
+    assert (defender["targetX"], defender["targetY"]) == (14500, 6500)
+    assert (left_tower["x"], left_tower["y"]) == (3500, 6500)
+
+
 def test_live_hand_and_draw_queue_offsets_match_visible_slots() -> None:
 
     deck = (
