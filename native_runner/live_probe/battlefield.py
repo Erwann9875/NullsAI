@@ -4,6 +4,8 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
 from ..battle_env import TOWER_LAYOUT, _fair_snapshot_damage_contract
+from ..building_placement_profiles import BUILDING_PLACEMENT_PROFILES
+from ..building_semantics import BuildingPlacementKind
 from ..contracts import EntityStateV1, EventV1, TowerStateV1
 from ..training.card_features import HERO_FORM_TO_BASE_CARD
 from ..training.v4.catalog import UNKNOWN_ENTITY_ARCHETYPE_VOCAB_ID
@@ -20,8 +22,9 @@ class BattlefieldFrame:
 
 
 class Battlefield:
-    def __init__(self, bundle: ProductionSemanticBundleV4) -> None:
+    def __init__(self, bundle: ProductionSemanticBundleV4, *, allow_unknown_entities: bool = False) -> None:
         self.bundle = bundle
+        self.allow_unknown_entities = allow_unknown_entities
         self.first_seen: dict[int, int] = {}
         self.previous_entities: dict[int, EntityStateV1] = {}
         self.previous_towers: dict[int, TowerStateV1] = {}
@@ -49,6 +52,9 @@ class Battlefield:
             if int(item["cardId"]) != -1 or key is None:
                 continue
             _, kind = key
+            registered = self.tower_registry.get((int(item["owner"]), kind))
+            if registered and int(item["nativeObjectId"]) != registered[0]:
+                continue
             hp = item.get("hp")
             maximum = item.get("maxHp")
             if hp is None or maximum is None:
@@ -89,12 +95,17 @@ class Battlefield:
         catalog = self.bundle.entity_archetype_catalog
         vocab = catalog.runtime_global_vocab_id(data_global_id)
         if vocab == UNKNOWN_ENTITY_ARCHETYPE_VOCAB_ID:
+            if self.allow_unknown_entities:
+                return "unknown"
             raise LiveLadderError(f"public entity dataGlobalId {data_global_id} is outside the checkpoint vocabulary")
         child_kind = catalog.metadata_for_vocab_id(vocab).child_kind
         if child_kind == "character":
             if card_id is not None:
                 spec = self.bundle.card_specs.get(card_id)
                 if spec is not None and spec.kind.value == "building":
+                    profile = BUILDING_PLACEMENT_PROFILES.get(card_id)
+                    if profile and profile.placement_kind == BuildingPlacementKind.MOVING_CHARACTER_DEPLOY:
+                        return "troop"
                     return "building"
             return "troop"
         if child_kind not in {"building", "projectile", "area", "effect"}:

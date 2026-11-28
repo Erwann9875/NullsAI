@@ -92,13 +92,14 @@ def _external_runtime(args: argparse.Namespace) -> AdbExternalReaderRuntime:
 def _arm_until_battle(client: ExternalLiveClient, account_id: int, wait_seconds: float) -> None:
     deadline = time.monotonic() + max(0.0, float(wait_seconds))
     while True:
+        quick = time.monotonic() < deadline
         try:
-            client.arm(account_id)
+            client.arm(account_id, quick=quick)
             return
         except ExternalMemoryError as error:
-            if time.monotonic() >= deadline:
+            if not quick:
                 raise LiveLadderError(f"could not identify an active attested Hog 2.6 battle: {error}") from error
-            time.sleep(0.25)
+            time.sleep(min(0.25, max(0, deadline - time.monotonic())))
 
 
 def _resolve_device(value: str) -> torch.device:

@@ -69,7 +69,10 @@ class PublicBattleSnapshot:
             else:
                 output[owner] = self.previous_tower_troops[owner]
             if output[owner] == 0:
-                raise ExternalMemoryError("public towers do not identify both Tower Troops")
+                evidence = [(item["owner"], item["x"], item["y"], item["dataGlobalId"]) for item in objects
+                            if item["cardId"] == -1 and item["hp"] is not None
+                            and item["x"] in (3500, 9000, 14500)]
+                raise ExternalMemoryError(f"public towers do not identify both Tower Troops (owner {owner}, visible {evidence})")
         self.previous_tower_troops = output.copy()
         return output
 

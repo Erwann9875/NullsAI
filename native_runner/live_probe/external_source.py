@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
+import os
 from pathlib import Path
 import re
 import socket
 import subprocess
 import time
+from tempfile import NamedTemporaryFile
 from typing import Callable, Mapping
 
 from .live_contracts import LiveLadderError, sha256_file
@@ -234,6 +237,15 @@ class ExternalLiveClient:
             card_costs=card_costs,
             local_account_id=self.local_account_id,
         )
+        self._hint_file = Path(__file__).resolve().parents[2] / ".runtime" / "battle-clock.json"
+        self._hint_scope = [runtime.serial, runtime.attestation.pid, runtime.attestation.libg_sha256,
+                            self.reader.libg_base, self.local_account_id]
+        try:
+            scope, manager, world = json.loads(self._hint_file.read_text(encoding="utf-8"))
+            if scope == self._hint_scope and all(type(n) is int and 0 < n < 2**64 for n in (manager, world)):
+                self.reader._clock_hint = (manager, world)
+        except (OSError, ValueError, TypeError):
+            pass
 
     def status(self) -> dict[str, object]:
         attestation = self.runtime.ensure_current()
@@ -259,11 +271,23 @@ class ExternalLiveClient:
             "localAccountId": self.local_account_id,
         }
 
-    def arm(self, account_id: int) -> BattleLayout:
+    def arm(self, account_id: int, *, quick: bool = False) -> BattleLayout:
         self.runtime.ensure_current()
         if int(account_id) != self.local_account_id:
             raise ExternalSourceError("requested account does not match the configured local account")
-        return self.reader.discover()
+        layout = self.reader.discover(quick=quick)
+        try:
+            self._hint_file.parent.mkdir(parents=True, exist_ok=True)
+            with NamedTemporaryFile(mode="w", encoding="utf-8", dir=self._hint_file.parent,
+                                    prefix=".battle-clock-", delete=False) as output:
+                json.dump([self._hint_scope, layout.manager, layout.world], output)
+            try:
+                os.replace(output.name, self._hint_file)
+            finally:
+                Path(output.name).unlink(missing_ok=True)
+        except OSError:
+            pass
+        return layout
 
     def disarm(self) -> None:
         self.reader.layout = None

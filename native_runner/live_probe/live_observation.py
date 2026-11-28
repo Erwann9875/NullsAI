@@ -27,13 +27,14 @@ from .play_ledger import PendingTouch, PlayLedger
 
 
 class LiveObservationBuilder:
-    def __init__(self) -> None:
+    def __init__(self, *, allow_unknown_entities: bool = False) -> None:
         self.bundle = production_semantic_bundle()
+        self.allow_unknown_entities = allow_unknown_entities
         self.placement = PlacementMaskBuilder(self.bundle.card_specs)
         self.generation: int | None = None
         self.episode_id: str | None = None
         self.last_tick = 0
-        self.battlefield = Battlefield(self.bundle)
+        self.battlefield = Battlefield(self.bundle, allow_unknown_entities=self.allow_unknown_entities)
         self.ledger = PlayLedger(COMMAND_EXECUTION_DELAY_TICKS, RECEIPT_TIMEOUT_TICKS)
         self.history: deque[EventV1] = deque()
         self.seen_public_events: set[int] = set()
@@ -51,7 +52,7 @@ class LiveObservationBuilder:
         self.generation = generation
         self.episode_id = f"{EPISODE_PREFIX}-{generation}"
         self.last_tick = 0
-        self.battlefield = Battlefield(self.bundle)
+        self.battlefield = Battlefield(self.bundle, allow_unknown_entities=self.allow_unknown_entities)
         self.ledger.pending.clear()
         self.ledger.receipts.clear()
         self.history.clear()

@@ -7,3 +7,4 @@ __pycache__/
 *.ckpt
 *.safetensors
 *.onnx
+tile-prior.npz

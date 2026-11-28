@@ -45,6 +45,22 @@ def test_live_device_auto_prefers_cuda_and_falls_back_to_cpu() -> None:
         assert str(_resolve_device("auto")) == "cpu"
 
 
+def test_last_quick_poll_can_cross_deadline_and_still_use_full_discovery(monkeypatch):
+    now = [0.0]
+    probes = []
+
+    def arm(account_id, *, quick):
+        probes.append(quick)
+        if quick:
+            now[0] = 2.0
+            raise ExternalMemoryError("waiting for an advancing local battle")
+
+    monkeypatch.setattr(live_ladder.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(live_ladder.time, "sleep", lambda seconds: None)
+    live_ladder._arm_until_battle(SimpleNamespace(arm=arm), 123, 1.0)
+    assert probes == [True, False]
+
+
 def test_live_snapshot_retry_recovers_from_a_transient_consistency_race() -> None:
     class Client:
         calls = 0
@@ -107,6 +123,23 @@ def test_live_builder_tensorizes_unknown_opponent_without_private_fields() -> No
         tensorizer.end_episode()
     assert int(batch.towers.mask.sum()) == 6
     assert int(batch.candidates.mask.sum()) == 4
+
+
+def test_light_reader_continues_through_furnace_and_unrecognized_public_entity():
+    builder = LiveObservationBuilder(allow_unknown_entities=True)
+    frame = battle_payload()
+    builder.build(frame)
+    furnace = dict(frame["objects"][0], nativeObjectId=101, owner=1, cardId=27_000_010,
+                   dataGlobalId=4_162_986_129, x=4000, y=16000)
+    unknown = dict(furnace, nativeObjectId=102, cardId=-1, dataGlobalId=1_892_649_387)
+    frame["objects"].extend([furnace, unknown])
+    frame.update(tick=20, sequence=2, returned=len(frame["objects"]))
+    obs = builder.build(frame)
+    assert [(e.entity_id, e.entity_kind, e.native_data_global_id) for e in obs.entities] == [
+        (101, "troop", 4_162_986_129), (102, "unknown", 1_892_649_387)]
+    assert any(obs.action_mask.hand_slots)
+    frame.update(tick=30, sequence=3)
+    assert builder.build(frame).tick == 30
 
 
 def test_touch_layout_maps_owner_zero_world_to_bottom_screen() -> None:

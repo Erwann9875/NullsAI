@@ -3,9 +3,11 @@ from __future__ import annotations
 from dataclasses import replace
 import struct
 import time
+from bisect import bisect_right
 from typing import Sequence
 
 from .public_snapshot import PublicBattleSnapshot
+from .world_index import LocalWorldIndex
 from .memory_types import (
     DECK_SLOT_VECTOR,
     HOG_26_SET,
@@ -31,7 +33,7 @@ from .memory_types import (
 )
 
 
-class BattleLayoutDiscoveryMixin:
+class BattleLayoutDiscoveryMixin(LocalWorldIndex):
     @staticmethod
     def _account_id(identity: bytes) -> int:
         high, low = struct.unpack_from("<II", identity)
@@ -48,6 +50,13 @@ class BattleLayoutDiscoveryMixin:
         return candidates.pop()
 
     def _mapped(self, address: int, size: int = 1, *, writable: bool = False) -> bool:
+        starts = getattr(self, "_map_starts", None)
+        if starts is not None:
+            index = bisect_right(starts, address) - 1
+            if index < 0:
+                return False
+            mapping = self.maps[index]
+            return mapping.readable and (not writable or mapping.writable) and mapping.contains(address, size)
         return any(
             mapping.readable and (not writable or mapping.writable) and mapping.contains(address, size)
             for mapping in self.maps
@@ -130,6 +139,8 @@ class BattleLayoutDiscoveryMixin:
         if not self._mapped(world, 0x200):
             return None
         data = self.memory.read(world, 0x200)
+        if data[WORLD_FINALIZED]:
+            return None
         identities = (_u64(data, WORLD_LOCAL_IDENTITY), _u64(data, WORLD_OPPONENT_IDENTITY))
         if any(not self._mapped(identity, 8) for identity in identities):
             return None
@@ -233,12 +244,119 @@ class BattleLayoutDiscoveryMixin:
         }
         return report
 
-    def discover(self) -> BattleLayout:
-        manager, world = self.discover_manager_world()
-        validated = self._validate_world(world)
+    def _moving_local_layout(self, manager, expected_world=None):
+        size = MANAGER_WORLD + 8
+        if not self._mapped(manager, size, writable=True):
+            return None
+        before = self.memory.read(manager, size)
+        world = _u64(before, MANAGER_WORLD)
+        if expected_world is not None and world != expected_world:
+            return None
+        first = _i32(before, MANAGER_TICK)
+        if not 0 <= first <= 200_000 or not self._mapped(world, 0x200, writable=True):
+            return None
+        sampled = time.monotonic()
+        layout = self._validate_world(world)
+        if layout is None:
+            return None
+        for until in (0.065, 0.16):
+            remaining = sampled + until - time.monotonic()
+            if remaining > 0:
+                time.sleep(remaining)
+            after = self.memory.read(manager, size)
+            delta = _i32(after, MANAGER_TICK) - first
+            if _u64(after, MANAGER_WORLD) != world or not 0 <= delta <= 50:
+                return None
+            if delta:
+                return replace(layout, manager=manager)
+        return None
+
+    def _nearby_heap(self, address, radius):
+        for mapping in self.maps:
+            if (mapping.name in {"[anon:scudo:primary]", "[anon:scudo:secondary]"}
+                    and mapping.readable and mapping.writable and mapping.contains(address)):
+                if radius is None:
+                    return (mapping,)
+                return (replace(mapping, start=max(mapping.start, (address - radius) & ~15),
+                                end=min(mapping.end, address + radius)),)
+        return ()
+
+    def _cached_layout(self, manager, world, *, quick=False):
+        direct = self._moving_local_layout(manager)
+        if direct:
+            self.discovery_source = "previous manager"
+            return direct
+        world_area = self._nearby_heap(world, None)
+        radii = (768 * 1024,) if quick else (768 * 1024, 3 * 1024 * 1024)
+        for radius in radii:
+            manager_area = self._nearby_heap(manager, radius)
+            if not world_area or not manager_area:
+                return None
+            moving = self._pool_clock_layout(manager_area, world_area)
+            if moving:
+                self.discovery_source = "previous battle allocation"
+                address, layout = moving
+                return replace(layout, manager=address)
+        return None
+
+    def _uncached_layout(self, *, quick=False):
+        primary = [r for r in self.maps if r.readable and r.writable and r.name == "[anon:scudo:primary]"]
+        mib = 1024 * 1024
+        managers = [replace(r, start=max(r.start, r.end - 4 * mib)) for r in primary if 35 * mib <= r.size <= 37 * mib]
+        worlds = [r for r in primary if 4 * mib <= r.size < 5 * mib]
+        if 0 < len(managers) <= 2 and worlds:
+            moving = self._pool_clock_layout(managers, worlds)
+            if moving:
+                self.discovery_source = "game build allocation"
+                address, layout = moving
+                return replace(layout, manager=address)
+        if quick:
+            raise ExternalMemoryError("waiting for an advancing local battle")
+        candidates = self._manager_candidates()
+        try:
+            manager, world = self._select_manager(candidates)
+            validated = self._validate_world(world)
+        except ExternalMemoryError as error:
+            if not (str(error).startswith(("expected one active GameState", "no active GameState"))
+                    or str(error) == "read range is not contained in a readable mapping"):
+                raise
+            validated = None
         if validated is None:
-            raise ExternalMemoryError("active GameState world does not match the attested Hog 2.6 layout")
-        self.layout = replace(validated, manager=manager)
+            self.discovery_source = "local world index"
+            verified = []
+            for world in self._local_world_candidates():
+                layout = self._validate_world(world)
+                if layout is None:
+                    continue
+                manager = self._manager_for_world(world)
+                if manager is None:
+                    continue
+                try:
+                    self._select_manager(((manager, world),))
+                except ExternalMemoryError:
+                    continue
+                verified.append((manager, layout))
+            if len(verified) != 1:
+                raise ExternalMemoryError(f'expected one advancing local battle, found {len(verified)}')
+            manager, validated = verified[0]
+        else:
+            self.discovery_source = "native game state"
+        return replace(validated, manager=manager)
+
+    def discover(self, *, quick=False) -> BattleLayout:
+        self.maps = tuple(sorted(self.memory.maps(), key=lambda mapping: mapping.start))
+        self._map_starts = tuple(mapping.start for mapping in self.maps)
+        self.layout = None
+        hint = getattr(self, "_clock_hint", None)
+        if hint:
+            try:
+                self.layout = self._cached_layout(*hint, quick=quick)
+            except ExternalMemoryError as error:
+                if str(error) != "read range is not contained in a readable mapping":
+                    raise
+        if self.layout is None:
+            self.layout = self._uncached_layout(quick=quick)
+        self._clock_hint = (self.layout.manager, self.layout.world)
         self.generation += 1
         self.public_state = PublicBattleSnapshot(self.card_costs)
         return self.layout

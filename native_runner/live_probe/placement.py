@@ -4,6 +4,7 @@ from collections.abc import Mapping, Sequence
 
 from ..arena import OccupiedFootprintV1, PlacementMaskV1, card_placement_mask, native_building_footprint
 from ..battle_env import _earliest_affordable_bin, _touch_window_elixir_raw
+from ..building_placement_profiles import BUILDING_PLACEMENT_PROFILES
 from ..contracts import ActionKind, ActionMaskV1, CardSpecV1, EntityStateV1, FrozenMapping, TowerStateV1
 from .live_contracts import LiveLadderError
 from .live_settings import RULESET_ID
@@ -38,6 +39,9 @@ class PlacementMaskBuilder:
                 continue
             footprint = native_building_footprint(spec)
             if footprint is None:
+                profile = BUILDING_PLACEMENT_PROFILES.get(entity.card_id)
+                if profile and profile.deploy_target_ready and not profile.stationary_collision_rectangle:
+                    continue
                 raise LiveLadderError(f"live building {entity.card_id} has no exact deployment footprint")
             result.append(
                 OccupiedFootprintV1(

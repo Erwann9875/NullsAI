@@ -27,22 +27,3 @@ def limit_cpu():
     if not kernel.SetPriorityClass(handle, 0x4000) or not kernel.SetProcessAffinityMask(handle, sum(selected)):
         raise OSError('Cannot apply low-impact CPU limits')
     return dict(priority='below-normal', affinity_mask=sum(selected), logical_cpus=len(selected))
-
-
-def memory():
-    if os.name != 'nt':
-        return {}
-    class Status(ctypes.Structure):
-        _fields_ = [('length', ctypes.c_ulong), ('load', ctypes.c_ulong)] + [(k, ctypes.c_ulonglong) for k in
-                    ('total', 'available', 'page_total', 'page_available', 'virtual_total', 'virtual_available', 'extended')]
-    s = Status()
-    s.length = ctypes.sizeof(s)
-    ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(s))
-    class Counters(ctypes.Structure):
-        _fields_ = [('cb', ctypes.c_ulong), ('faults', ctypes.c_ulong)] + [(k, ctypes.c_size_t) for k in
-                    ('peak_ws', 'ws', 'peak_pool_paged', 'pool_paged', 'peak_pool_nonpaged', 'pool_nonpaged', 'page', 'peak_page')]
-    c = Counters()
-    c.cb = ctypes.sizeof(c)
-    ctypes.windll.psapi.GetProcessMemoryInfo.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_ulong]
-    ctypes.windll.psapi.GetProcessMemoryInfo(ctypes.windll.kernel32.GetCurrentProcess(), ctypes.byref(c), c.cb)
-    return dict(available_mb=round(s.available/1048576), process_mb=round(c.ws/1048576), peak_process_mb=round(c.peak_ws/1048576))
