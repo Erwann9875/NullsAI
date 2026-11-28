@@ -117,10 +117,7 @@ class BattleLayoutDiscoveryMixin(LocalWorldIndex):
     def discover_manager_world(self) -> tuple[int, int]:
         return self._select_manager(self._manager_candidates())
 
-    def _deck_ids(self, deck: int) -> tuple[int, ...] | None:
-        if not self._mapped(deck, 0x30):
-            return None
-        header = self.memory.read(deck, 0x30)
+    def _deck_ids(self, header: bytes) -> tuple[int, ...] | None:
         slots = _vector(header, DECK_SLOT_VECTOR, 32)
         if slots is None or slots.count != 8 or not self._mapped(slots.data, 64):
             return None
@@ -182,7 +179,7 @@ class BattleLayoutDiscoveryMixin(LocalWorldIndex):
             or not 0 <= elixir <= 100_000
         ):
             return None
-        deck = self._deck_ids(local_deck)
+        deck = self._deck_ids(local_deck_data)
         if deck is None or frozenset(deck) != HOG_26_SET:
             return None
         object_manager = _u64(root, ROOT_OBJECT_MANAGER)
@@ -299,9 +296,59 @@ class BattleLayoutDiscoveryMixin(LocalWorldIndex):
                 return replace(layout, manager=address)
         return None
 
+    def _kickoff_areas(self):
+        """Allocation classes on the attested game build, independent of ASLR and committed size."""
+        heap = [r for r in self.maps if r.readable and r.writable and r.name == "[anon:scudo:primary]"]
+        if not heap:
+            return (), ()
+        mib = 1024 * 1024
+        origin = min(r.start for r in heap)
+        def slot(region):
+            return (region.start - origin + 128*mib) // (256*mib)
+        pools = [r for r in heap if slot(r) == 14 and r.size >= 8*mib]
+        worlds = [r for r in heap if slot(r) == 16]
+        return tuple(replace(r, start=r.end-8*mib) for r in pools), tuple(worlds)
+
+    def prepare_kickoff(self):
+        managers, worlds = self._kickoff_areas()
+        self._lobby_candidates = self._pool_candidates(managers, worlds) if worlds else {}
+        return len(self._lobby_candidates)
+
+    def _kickoff_clock(self, managers, worlds, quick):
+        # The first two practice captures on separate game processes landed
+        # within 32 KiB of the 4 MiB mark. An earlier allocation was 2.54 MiB
+        # from the end. Read both small windows in one bounded transfer.
+        kib = 1024
+        windows = [(area.end - distance - 192*kib, 384*kib)
+                   for area in managers for distance in (4096*kib, 2560*kib)]
+        rows = self._candidate_reads(windows)
+        chunks = [(base, data) for (base, _), data in zip(windows, rows, strict=True) if data is not None]
+        candidates = self._chunk_clock_candidates(chunks, worlds)
+        lobby = getattr(self, "_lobby_candidates", {})
+        moving = self._moving_candidates({p: row for p, row in candidates.items() if row != lobby.get(p)})
+        if moving:
+            self.discovery_source = "cold kickoff window"
+            return moving
+        attempt = getattr(self, "_cold_attempt", 0) + 1
+        self._cold_attempt = attempt
+        if not quick or attempt % 5 == 0:
+            candidates = self._pool_candidates(managers, worlds)
+            moving = self._moving_candidates({p: row for p, row in candidates.items() if row != lobby.get(p)})
+            if moving:
+                self.discovery_source = "cold allocation class"
+                return moving
+        return None
+
     def _uncached_layout(self, *, quick=False):
         primary = [r for r in self.maps if r.readable and r.writable and r.name == "[anon:scudo:primary]"]
         mib = 1024 * 1024
+        manager_areas, world_areas = self._kickoff_areas()
+        if manager_areas and world_areas:
+            moving = self._kickoff_clock(manager_areas, world_areas, quick)
+            if moving:
+                return replace(moving[1], manager=moving[0])
+            if quick:
+                raise ExternalMemoryError("waiting for an advancing local battle")
         managers = [replace(r, start=max(r.start, r.end - 4 * mib)) for r in primary if 35 * mib <= r.size <= 37 * mib]
         worlds = [r for r in primary if 4 * mib <= r.size < 5 * mib]
         if 0 < len(managers) <= 2 and worlds:
@@ -343,9 +390,12 @@ class BattleLayoutDiscoveryMixin(LocalWorldIndex):
             self.discovery_source = "native game state"
         return replace(validated, manager=manager)
 
-    def discover(self, *, quick=False) -> BattleLayout:
+    def refresh_maps(self):
         self.maps = tuple(sorted(self.memory.maps(), key=lambda mapping: mapping.start))
         self._map_starts = tuple(mapping.start for mapping in self.maps)
+
+    def discover(self, *, quick=False) -> BattleLayout:
+        self.refresh_maps()
         self.layout = None
         hint = getattr(self, "_clock_hint", None)
         if hint:
@@ -359,6 +409,7 @@ class BattleLayoutDiscoveryMixin(LocalWorldIndex):
         if self.layout is None:
             self.layout = self._uncached_layout(quick=quick)
         self._clock_hint = (self.layout.manager, self.layout.world)
+        self._frame_plan = ()
         self._quick_hint_attempts = 0
         self.generation += 1
         self.public_state = PublicBattleSnapshot(self.card_costs)

@@ -52,6 +52,10 @@ class ExternalMemoryError(RuntimeError):
     pass
 
 
+class InconsistentBattleFrame(ExternalMemoryError):
+    """The clock advanced too far while reading this frame."""
+
+
 @dataclass(frozen=True, slots=True)
 class ProcessMapping:
     start: int

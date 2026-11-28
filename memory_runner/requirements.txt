@@ -2,3 +2,4 @@ numpy==2.5.5
 lxml==6.1.3
 Pillow==12.1.1
 pyelftools==0.33
+JPype1==1.7.1

@@ -23,6 +23,11 @@ def aim_for(card, unit, group, towers):
     tx, ty = tower.position if tower else (9000, 3000)
     x, y = projected(unit, 18)
     inward = 1 if unit.x < 9000 else -1
+    if getattr(unit,'structure',False) and card in {'hog-rider','ice-golem','musketeer'}:
+        bridge_x = 3500 if unit.x < 9000 else 14500
+        if card == 'musketeer':
+            return x + inward * 700, min(14500, y-5200)
+        return bridge_x, 14500
     if card == 'fireball':
         points = [projected(member, 18) for member in group]
         return tuple(np.mean(points, axis=0))
@@ -39,7 +44,7 @@ def aim_for(card, unit, group, towers):
     return x + intercept * dx / length, y + intercept * dy / length
 
 
-def closest_defensive_tile(card, rows, aim, prior, towers):
+def closest_defensive_tile(card, rows, aim, prior, towers, learned=None):
     legal = np.array(rows, dtype=bool, copy=True)
     if card not in {'the-log', 'fireball'}:
         legal &= Y < 16000
@@ -53,5 +58,7 @@ def closest_defensive_tile(card, rows, aim, prior, towers):
     distance = ((X - aim[0]) / 1000)**2 + ((Y - aim[1]) / 1000)**2
     # Bound the replay preference so a popular tile cannot pull a defender away from its intercept.
     score = -distance + 0.2 * np.tanh(prior[PRIOR_INDEX] / 4)
+    if learned is not None:
+        score += 1.15 * np.clip(learned - learned.max(), -5., 0.)
     row, col = np.unravel_index(np.argmax(np.where(legal, score, -np.inf)), score.shape)
     return int(X[row, col]), int(Y[row, col])

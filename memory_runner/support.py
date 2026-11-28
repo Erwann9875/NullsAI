@@ -1,9 +1,8 @@
 import ctypes
 import os
 
-import torch
-
 def model_points(out):
+    import torch
     tiles = torch.arange(576)
     xy = torch.stack(((tiles % 32 + .5) / 32, (tiles // 32 + .5) / 18), dim=1)
     if out.get('offset') is not None:

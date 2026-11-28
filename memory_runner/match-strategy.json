@@ -1,0 +1,38 @@
+{
+  "parameters": {
+    "matchup_gate": true,
+    "rollout_weight": 1,
+    "rollout_interval": 20,
+    "search_width": 7,
+    "horizon": 150,
+    "reserve_value": 168,
+    "defense_value": 1.15,
+    "correct_board": true,
+    "diverse": true,
+    "by_cost": true,
+    "specialist_triggers": [
+      "giant",
+      "prince",
+      "dark-prince",
+      "mega-minion",
+      "minions"
+    ],
+    "general_triggers": [
+      "balloon",
+      "baby-dragon",
+      "bowler",
+      "freeze",
+      "lumberjack"
+    ],
+    "attack_margin": -0.18,
+    "near_tower_margin": 0.15
+  },
+  "general": {
+    "rollout_weight": 0.5,
+    "rollout_threshold": 0.31,
+    "rollout_interval": 20,
+    "attack_margin": 0.12,
+    "defensive_margin": 0.02,
+    "near_tower_margin": 0.3
+  }
+}

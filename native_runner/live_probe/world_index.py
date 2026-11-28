@@ -14,10 +14,12 @@ from .memory_types import (
 
 
 class LocalWorldIndex:
-    def _pool_clock_layout(self, manager_areas, world_areas):
-        """Revalidate moving clocks in the allocation classes used by this build."""
+    def _pool_candidates(self, manager_areas, world_areas):
+        return self._chunk_clock_candidates(self._chunks(manager_areas), world_areas)
+
+    def _chunk_clock_candidates(self, chunks, world_areas):
         candidates = {}
-        for base, data in self._chunks(manager_areas):
+        for base, data in chunks:
             start = (-base) % 16
             n = (len(data) - start - MANAGER_WORLD - 8) // 16 + 1
             if n <= 0:
@@ -31,7 +33,13 @@ class LocalWorldIndex:
             for i in np.flatnonzero(eligible):
                 candidates[base + start + 16 * int(i)] = (int(worlds[i]), int(ticks[i]))
             if len(candidates) > 1024:
-                return None
+                return {}
+        return candidates
+
+    def _pool_clock_layout(self, manager_areas, world_areas):
+        return self._moving_candidates(self._pool_candidates(manager_areas, world_areas))
+
+    def _moving_candidates(self, candidates):
         if not candidates:
             return None
         size = MANAGER_WORLD + 8 - MANAGER_TICK

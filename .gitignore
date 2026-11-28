@@ -7,4 +7,9 @@ __pycache__/
 *.ckpt
 *.safetensors
 *.onnx
-tile-prior.npz
+*.npz
+*.npy
+*.pkl
+*.joblib
+*.gguf
+*.class

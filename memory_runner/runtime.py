@@ -1,10 +1,12 @@
 from contextlib import contextmanager
 import os
 from pathlib import Path
+from queue import Empty, Queue
 import shlex
 import shutil
 import subprocess
 import sys
+from threading import Thread
 import time
 
 REPO = Path(__file__).resolve().parents[1]
@@ -40,6 +42,54 @@ def bridge(args, costs):
     class RootShellRuntime(AdbExternalReaderRuntime):
         forwarded = False
         uploaded = False
+        pid_query = None
+        reader_pid = None
+
+        def _pid(self):
+            if self.pid_query is None:
+                # A fixed pidof command, over ordinary ADB, for every identity check.
+                command = 'while read -r request; do pidof -s nullsroyale.rel.free || echo missing; done'
+                self.pid_query = subprocess.Popen(
+                    self.command + ['shell', '-T', command],
+                    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                    creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0),
+                )
+                self.pid_lines = Queue()
+                def read_replies(pipe, replies):
+                    for line in pipe:
+                        replies.put(line.strip())
+                    replies.put(b'')
+                self.pid_thread = Thread(target=read_replies, args=(self.pid_query.stdout, self.pid_lines),
+                                         daemon=True)
+                self.pid_thread.start()
+            self.pid_query.stdin.write(b'pid\n')
+            self.pid_query.stdin.flush()
+            try:
+                result = self.pid_lines.get(timeout=5)
+            except Empty as exc:
+                raise RuntimeError('Timed out checking the game process over ADB') from exc
+            if not result.isdigit() or int(result) <= 0:
+                raise RuntimeError('The attested game is no longer running')
+            return int(result)
+
+        def close(self):
+            try:
+                if self.reader_pid is not None:
+                    path = shlex.quote(self.remote_reader)
+                    remote = f'if [ "$(readlink /proc/{self.reader_pid}/exe)" = {path} ]; then kill -TERM {self.reader_pid}; fi'
+                    self._run('shell', f'su -c {shlex.quote(remote)}', check=False)
+            finally:
+                super().close()
+                if self.pid_query is not None:
+                    self.pid_query.stdin.close()
+                    try:
+                        self.pid_query.wait(timeout=2)
+                    except subprocess.TimeoutExpired:
+                        self.pid_query.kill()
+                        self.pid_query.wait(timeout=2)
+                    self.pid_thread.join(timeout=2)
+                    self.pid_query.stdout.close()
+                    self.pid_query = None
 
         def _forward(self):
             self._run('forward', '--no-rebind', f'tcp:{self.port}', f'tcp:{self.port}')
@@ -51,13 +101,24 @@ def bridge(args, costs):
             self._run('shell', 'chmod', '700', self.remote_reader)
             if self._run('shell', 'sha256sum', self.remote_reader).split()[0] != reader_hash:
                 raise RuntimeError('The device reader does not match the pinned binary')
-            command = f'exec {self.remote_reader} {pid} {self.port}'
+            command = f'echo $$; exec {self.remote_reader} {pid} {self.port}'
             self.process = subprocess.Popen(
                 self.command + ['shell', '-T', f'su -c {shlex.quote(command)}'],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                 creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0),
             )
             self.owns_process = True
+            reply = Queue()
+            def read_startup_pid(pipe):
+                reply.put(pipe.readline().strip())
+            Thread(target=read_startup_pid, args=(self.process.stdout,), daemon=True).start()
+            try:
+                reported_pid = reply.get(timeout=8)
+            except Empty as exc:
+                raise RuntimeError('Timed out waiting for the read-only sidecar to start') from exc
+            if not reported_pid.isdigit() or int(reported_pid) <= 0:
+                raise RuntimeError('The read-only sidecar did not report its process ID')
+            self.reader_pid = int(reported_pid)
             for _ in range(30):
                 if self.process.poll() is not None:
                     break

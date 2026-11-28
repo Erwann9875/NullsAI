@@ -14,6 +14,7 @@ from .memory_types import (
     MAX_OBJECTS,
     MAX_SNAPSHOT_ATTEMPTS,
     MAX_SNAPSHOT_TICK_SPAN,
+    MAX_TRANSFER,
     ROOT_CYCLE_VECTOR,
     ROOT_ELIXIR,
     ROOT_HAND_VECTOR,
@@ -25,6 +26,7 @@ from .memory_types import (
     WORLD_RESULT,
     BattleLayout,
     ExternalMemoryError,
+    InconsistentBattleFrame,
     _i32,
     _u32,
     _u64,
@@ -32,8 +34,44 @@ from .memory_types import (
 )
 
 
+class PublicFrameReads:
+    """Re-read the last public frame's ranges together, then follow the current pointers."""
+    def __init__(self, memory, plan, clock):
+        self.memory = memory
+        self.used = {}
+        self.values = {}
+        self.clock = clock
+        self.final_clock = None
+        if plan and len(plan) < 1024 and sum(size for _, size in plan) + 4 <= MAX_TRANSFER:
+            try:
+                rows = memory.readv((*plan, clock))
+            except ExternalMemoryError as error:
+                if str(error) != "read range is not contained in a readable mapping":
+                    raise
+            else:
+                self.values = dict(zip(plan, rows[:-1], strict=True))
+                self.final_clock = rows[-1]
+
+    def readv(self, ranges):
+        ranges = tuple(ranges)
+        self.used.update(dict.fromkeys(ranges))
+        missing = tuple(dict.fromkeys(r for r in ranges if r not in self.values))
+        if missing:
+            if len(missing) < 1024 and sum(size for _, size in missing) + 4 <= MAX_TRANSFER:
+                rows = self.memory.readv((*missing, self.clock))
+                self.values.update(zip(missing, rows[:-1], strict=True))
+                self.final_clock = rows[-1]
+            else:
+                self.final_clock = None
+                self.values.update(zip(missing, self.memory.readv(missing), strict=True))
+        return tuple(self.values[r] for r in ranges)
+
+    def closing_tick(self):
+        return _i32(self.final_clock if self.final_clock is not None else self.memory.read(*self.clock), 0)
+
+
 class BattleSnapshotMixin:
-    def _own_state(self, layout: BattleLayout, root: bytes) -> tuple[list[int], list[int], int]:
+    def _own_state(self, layout: BattleLayout, root: bytes, reads=None) -> tuple[list[int], list[int], int]:
         hand = _vector(root, ROOT_HAND_VECTOR, 16)
         cycle = _vector(root, ROOT_CYCLE_VECTOR, 32)
         if hand is None or cycle is None or hand.count > 4 or cycle.count > 8:
@@ -43,10 +81,15 @@ class BattleSnapshotMixin:
         for name, vector in (("hand", hand), ("cycle", cycle)):
             if vector.count:
                 if not self._mapped(vector.data, vector.count * 4):
-                    raise ExternalMemoryError(f"local {name} vector is not readable")
+                    now = time.monotonic()
+                    if now - getattr(self, "_hand_map_refresh", -float("inf")) >= .5:
+                        self.refresh_maps()
+                        self._hand_map_refresh = now
+                    if not self._mapped(vector.data, vector.count * 4):
+                        raise ExternalMemoryError(f"local {name} vector is not readable")
                 ranges.append((vector.data, vector.count * 4))
                 labels.append(name)
-        payloads = self.memory.readv(ranges)
+        payloads = (reads if reads is not None else self.memory).readv(ranges)
         raw: dict[str, tuple[int, ...]] = {"hand": (), "cycle": ()}
         for name, payload in zip(labels, payloads, strict=True):
             raw[name] = struct.unpack(f"<{len(payload) // 4}i", payload)
@@ -65,17 +108,17 @@ class BattleSnapshotMixin:
             raise ExternalMemoryError("local elixir is outside its exact native range")
         return output["hand"], output["cycle"], elixir
 
-    def _objects(self, layout: BattleLayout, root: bytes) -> list[dict[str, object]]:
+    def _objects(self, layout: BattleLayout, root: bytes, manager_data: bytes, reads) -> list[dict[str, object]]:
         object_manager = _u64(root, ROOT_OBJECT_MANAGER)
         if object_manager != layout.object_manager:
             raise ExternalMemoryError("native object manager changed during the battle")
-        manager_data = self.memory.read(object_manager, 0x18)
         vector = _vector(manager_data, 0x08, 100_000)
         if vector is None or vector.count > MAX_OBJECTS or not self._mapped(vector.data, vector.count * 8):
             raise ExternalMemoryError("public object vector is invalid or exceeds its fair snapshot bound")
-        pointers = struct.unpack(f"<{vector.count}Q", self.memory.read(vector.data, vector.count * 8))
+        (pointer_data,) = reads.readv(((vector.data, vector.count * 8),))
+        pointers = struct.unpack(f"<{vector.count}Q", pointer_data)
         object_pairs = [(pointer, 0xB0) for pointer in pointers if pointer and self._mapped(pointer, 0xB0)]
-        object_data = self.memory.readv(object_pairs)
+        object_data = reads.readv(object_pairs)
         bases = {pointer: data for (pointer, _), data in zip(object_pairs, object_data, strict=True)}
 
         component_ranges: dict[int, tuple[int, int]] = {}
@@ -91,7 +134,7 @@ class BattleSnapshotMixin:
             if logic and self._mapped(logic, 0x44):
                 logic_data_pointers.add(logic)
 
-        component_payloads = self.memory.readv(tuple(component_ranges.values()))
+        component_payloads = reads.readv(tuple(component_ranges.values()))
         components_by_object = {
             pointer: struct.unpack(f"<{len(payload) // 8}Q", payload)
             for pointer, payload in zip(component_ranges, component_payloads, strict=True)
@@ -105,7 +148,7 @@ class BattleSnapshotMixin:
         all_ranges = tuple((pointer, 0x44) for pointer in sorted(logic_data_pointers)) + tuple(
             (pointer, 0x38) for pointer in sorted(component_pointers)
         )
-        all_payloads = self.memory.readv(all_ranges)
+        all_payloads = reads.readv(all_ranges)
         payload_by_pointer = {
             pointer: payload for (pointer, _), payload in zip(all_ranges, all_payloads, strict=True)
         }
@@ -188,12 +231,14 @@ class BattleSnapshotMixin:
     def snapshot(self, after_event: int = 0) -> dict[str, object]:
         layout = self.layout or self.discover()
         for _attempt in range(MAX_SNAPSHOT_ATTEMPTS):
-            manager, world, root, identity = self.memory.readv(
+            reads = PublicFrameReads(self.memory, getattr(self, "_frame_plan", ()), (layout.manager + MANAGER_TICK, 4))
+            manager, world, root, identity, manager_data = reads.readv(
                 (
                     (layout.manager, 0xB0),
                     (layout.world, 0x200),
                     (layout.local_root, 0x310),
                     (layout.local_identity, 8),
+                    (layout.object_manager, 0x18),
                 )
             )
             if _u64(manager, MANAGER_WORLD) != layout.world:
@@ -208,13 +253,14 @@ class BattleSnapshotMixin:
             if self._account_id(identity) != layout.account_id:
                 raise ExternalMemoryError("local account identity changed")
             tick_before = _i32(manager, MANAGER_TICK)
-            hand, cycle, elixir = self._own_state(layout, root)
-            objects = self._normalize_objects(layout, self._objects(layout, root))
-            tick_after = _i32(self.memory.read(layout.manager + MANAGER_TICK, 4), 0)
+            hand, cycle, elixir = self._own_state(layout, root, reads)
+            objects = self._normalize_objects(layout, self._objects(layout, root, manager_data, reads))
+            self._frame_plan = tuple(reads.used)
+            tick_after = reads.closing_tick()
             if tick_before <= tick_after <= tick_before + MAX_SNAPSHOT_TICK_SPAN:
                 break
         else:
-            raise ExternalMemoryError("native state changed across three bounded snapshot attempts")
+            raise InconsistentBattleFrame(f"battle clock changed from {tick_before} to {tick_after} during the last frame read")
         return self.public_state.publish(
             generation=self.generation,
             tick=tick_after,
