@@ -1,4 +1,3 @@
-"""Network layers required to load the v3 checkpoint for inference."""
 import torch
 from torch import nn
 from rl.banana_hog_retrain import StableHogPolicy

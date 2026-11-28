@@ -1,4 +1,3 @@
-"""Greedy inference and spatial defense for the screen-based Null's Royale runner."""
 from dataclasses import dataclass
 from functools import lru_cache
 import math
@@ -39,11 +38,8 @@ class Threat:
 
 
 def visible_threats(image):
-    """Find short red HP bars on the visible board, excluding tower HUD rows."""
     crop = np.asarray(image.crop((85, 405, 815, 1215)))[::2, ::2, :3]
     red, green, blue = crop.transpose(2, 0, 1)
-    # Read the dark-red frame rather than the fill. A nearly defeated troop may
-    # have only a few colored pixels left and temporary buffs can change the fill.
     mask = (red >= 76) & (red <= 119) & (green <= 13) & (blue >= 18) & (blue <= 46)
     padded = np.pad(mask, ((0, 0), (1, 1)))
     edges = padded[:, 1:] ^ padded[:, :-1]
@@ -103,7 +99,6 @@ def tile_tables():
 
 
 def defense_move(hand, elixir, threats, past_defense, now):
-    # Protect the own half and the bridge. Ignore enemy groups still far back.
     incoming = tuple(t for t in threats if 800 <= t.y <= 16300)
     if not incoming:
         return None
@@ -111,8 +106,6 @@ def defense_move(hand, elixir, threats, past_defense, now):
     lane = int(priority.x >= 9000)
     if past_defense is not None:
         previous, previous_lane, previous_y = past_defense
-        # A confirmed defender is already responding, unless the same wave has
-        # since moved much closer to a tower or a new lane is under pressure.
         if lane == previous_lane and now - previous < 4 and priority.y >= previous_y - 2500:
             return Move(reason='defender_recently_deployed')
 
@@ -124,13 +117,10 @@ def defense_move(hand, elixir, threats, past_defense, now):
         aim_y = round(sum(t.y for t in cluster) / len(cluster))
     elif 'musketeer' in ready:
         card = 'musketeer'
-        # Set a ranged defender back and slightly toward the middle of the lane.
         aim_x = priority.x + (1200 if lane == 0 else -1200)
         aim_y = priority.y - 3700
     elif 'cannon' in ready and priority.y >= 7000:
         card = 'cannon'
-        # Central pull on the threatened side. Do not spend Cannon on a troop
-        # already behind the placement because it cannot pull it back reliably.
         aim_x = 7100 if lane == 0 else 10900
         aim_y = min(11200, max(7200, priority.y - 3000))
     elif priority.y < 10500 and 'ice-spirit' in ready:
@@ -151,7 +141,6 @@ def defense_move(hand, elixir, threats, past_defense, now):
 
 
 class GreedyPolicy:
-    """Single-observation decoder for the pinned v4.4.2 actor and v3 residual."""
 
     def __init__(self, agent):
         self.agent = agent
@@ -179,8 +168,6 @@ class GreedyPolicy:
         length = int(inputs[12])
         model = self.model
 
-        # Replay encoding is independent of affordability and the clock globals.
-        # Compare the actual tensors because event time features may change.
         history = (continuous, ids, length)
         if (self.history is None or length != self.history[2]
                 or not torch.equal(continuous, self.history[0]) or not torch.equal(ids, self.history[1])):

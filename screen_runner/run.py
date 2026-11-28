@@ -1,4 +1,3 @@
-"""One-thread, screen-only runner for Null's Royale."""
 import argparse
 import hashlib
 import json
@@ -90,13 +89,10 @@ def elixir_value(image):
         return None
     visible = min(10.,(last+1)/61.)
     next_mark = math.ceil(visible)
-    # The black divider at a whole-elixir mark obscures a few filled pixels.
     return float(next_mark) if next_mark-visible <= .13 else visible
 
 
 def battlefield(image):
-    # The timer is the stable black HUD box in the top-right corner. The hand
-    # detector supplies an independent check before any drag is permitted.
     pixel = image.getpixel((747,45))
     return max(pixel)<36
 
