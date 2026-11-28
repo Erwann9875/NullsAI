@@ -22,10 +22,22 @@ const GAME_STATE_BYTES: usize = 0x228;
 const MIN_GAME_STATE_SIZE_CLASS_BYTES: u64 = 32 * 1024 * 1024;
 const GAME_STATE_SIZE_CLASS_TAIL_BYTES: u64 = 20 * 1024 * 1024;
 
+// ARM64 libg.so layout for Nulls Royale 16.635.1.
+const LIBG_BUILD_NOTE_RVA: u64 = 0x1c0d770;
+const LIBG_BUILD_NOTE: [u8; 36] = [
+    4, 0, 0, 0, 20, 0, 0, 0, 3, 0, 0, 0, b'G', b'N', b'U', 0, 0x17, 0x9a, 0xc4, 0xbd, 0x38, 0xc2,
+    0x05, 0xbc, 0x50, 0x41, 0xd3, 0x72, 0xa7, 0x9f, 0x1c, 0x2f, 0x92, 0x9b, 0x1c, 0x30,
+];
+const GAME_CONTEXT_RVA: u64 = 0x1b7d210;
+const LOCAL_AVATAR_OFFSET: u64 = 0x50;
+const AVATAR_VTABLE_RVA: u64 = 0x1a26758;
+const AVATAR_TROPHIES_OFFSET: u64 = 0x88;
+
 #[derive(Clone)]
 struct Mapping {
     start: u64,
     end: u64,
+    file_offset: u64,
     readable: bool,
     writable: bool,
     name: String,
@@ -72,21 +84,27 @@ fn mappings(pid: u32) -> io::Result<Vec<Mapping>> {
         let mut fields = line.split_ascii_whitespace();
         let Some(range) = fields.next() else { continue };
         let Some(perms) = fields.next() else { continue };
-        let _offset = fields.next();
+        let Some(offset) = fields.next() else {
+            continue;
+        };
         let _device = fields.next();
         let _inode = fields.next();
         let name = fields.collect::<Vec<_>>().join(" ");
         let Some((start, end)) = range.split_once('-') else {
             continue;
         };
-        let (Ok(start), Ok(end)) = (u64::from_str_radix(start, 16), u64::from_str_radix(end, 16))
-        else {
+        let (Ok(start), Ok(end), Ok(file_offset)) = (
+            u64::from_str_radix(start, 16),
+            u64::from_str_radix(end, 16),
+            u64::from_str_radix(offset, 16),
+        ) else {
             continue;
         };
         if start < end {
             result.push(Mapping {
                 start,
                 end,
+                file_offset,
                 readable: perms.as_bytes().first() == Some(&b'r'),
                 writable: perms.as_bytes().get(1) == Some(&b'w'),
                 name,
@@ -203,6 +221,69 @@ impl Reader {
             .iter()
             .map(|(address, size)| read_exact_at(&self.memory, *address, *size))
             .collect()
+    }
+
+    fn trophy_bytes<const N: usize>(
+        &self,
+        maps: &[Mapping],
+        base: u64,
+        offset: u64,
+    ) -> io::Result<[u8; N]> {
+        let address = base
+            .checked_add(offset)
+            .filter(|address| permitted(maps, *address, N))
+            .ok_or_else(|| io::Error::other("trophy read is outside readable game memory"))?;
+        let mut bytes = [0; N];
+        self.memory.read_exact_at(&mut bytes, address)?;
+        Ok(bytes)
+    }
+
+    fn trophy_count(&self) -> io::Result<Option<i32>> {
+        let maps = self.validate()?;
+        let mut libg_bases = maps.iter().filter(|mapping| {
+            mapping.readable
+                && mapping.file_offset == 0
+                && mapping.name.ends_with("/lib/arm64/libg.so")
+        });
+        let Some(base) = libg_bases.next().map(|mapping| mapping.start) else {
+            return Ok(None);
+        };
+        if libg_bases.next().is_some() {
+            return Err(io::Error::other("expected exactly one ARM64 libg.so base"));
+        }
+        if self.trophy_bytes(&maps, base, LIBG_BUILD_NOTE_RVA)? != LIBG_BUILD_NOTE {
+            return Err(io::Error::other(
+                "unsupported libg.so build for trophy read",
+            ));
+        }
+
+        let pointer = |base, offset| {
+            self.trophy_bytes(&maps, base, offset)
+                .map(u64::from_le_bytes)
+        };
+        let context = pointer(base, GAME_CONTEXT_RVA)?;
+        if context == 0 {
+            return Ok(None);
+        }
+        let avatar = pointer(context, LOCAL_AVATAR_OFFSET)?;
+        if avatar == 0 {
+            return Ok(None);
+        }
+        if Some(pointer(avatar, 0)?) != base.checked_add(AVATAR_VTABLE_RVA) {
+            return Err(io::Error::other(
+                "unexpected local avatar type for trophy read",
+            ));
+        }
+        let count = i32::from_le_bytes(self.trophy_bytes(&maps, avatar, AVATAR_TROPHIES_OFFSET)?);
+        if count < 0 {
+            return Err(io::Error::other("invalid negative trophy count"));
+        }
+        if pointer(base, GAME_CONTEXT_RVA)? != context
+            || pointer(context, LOCAL_AVATAR_OFFSET)? != avatar
+        {
+            return Ok(None);
+        }
+        Ok(Some(count))
     }
 
     fn scan_game_states(&self) -> io::Result<Vec<(u64, u64)>> {
@@ -346,10 +427,17 @@ fn handle_command(stream: &mut TcpStream, reader: &Reader, command: &str) -> io:
             stream.write_all(payload.as_bytes())?;
             stream.flush()?;
         }
+        "trophies" if fields.len() == 2 => {
+            // A signed little-endian -1 distinguishes an unloaded avatar from zero trophies.
+            let payload = reader.trophy_count()?.unwrap_or(-1).to_le_bytes();
+            writeln!(stream, "OK {}", payload.len())?;
+            stream.write_all(&payload)?;
+            stream.flush()?;
+        }
         "quit" if fields.len() == 2 => return Ok(true),
         _ => write_error(
             stream,
-            "supported commands are status, maps, read, readv, scan-gamestate and quit",
+            "supported commands are status, maps, read, readv, scan-gamestate, trophies and quit",
         )?,
     }
     Ok(false)

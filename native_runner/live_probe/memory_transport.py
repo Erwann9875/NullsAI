@@ -30,6 +30,8 @@ class MemoryTransport(Protocol):
 
     def scan_game_states(self) -> tuple[tuple[int, int], ...]: ...
 
+    def trophy_count(self) -> int | None: ...
+
     def read(self, address: int, size: int) -> bytes: ...
 
     def readv(self, ranges: Sequence[tuple[int, int]]) -> tuple[bytes, ...]: ...
@@ -110,6 +112,16 @@ class ExternalReaderClient:
                 raise ExternalMemoryError("external reader returned a malformed GameState candidate")
             result.append((candidate[0], candidate[1]))
         return tuple(result)
+
+    def trophy_count(self) -> int | None:
+        """Read the local avatar's trophies, or None while the avatar loads."""
+        payload = self._binary(f"trophies {TOKEN}")
+        if len(payload) != 4:
+            raise ExternalMemoryError("external reader returned an invalid trophy payload length")
+        count = int.from_bytes(payload, "little", signed=True)
+        if count < -1:
+            raise ExternalMemoryError("external reader returned an invalid trophy count")
+        return None if count == -1 else count
 
     def read(self, address: int, size: int) -> bytes:
         if address <= 0 or size <= 0 or size > MAX_TRANSFER:
