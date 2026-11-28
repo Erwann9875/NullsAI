@@ -13,6 +13,8 @@ def main():
     p.add_argument('--log',type=Path,required=True)
     p.add_argument('--wait',type=float,default=65.)
     p.add_argument('--observe-only',action='store_true')
+    p.add_argument('--placement-input', choices=('drag','tap'), default='drag',
+                   help='Drag to the target tile (default) or tap the card and tile separately.')
     p.add_argument('--without-clock-cache',action='store_true')
     p.add_argument('--start-signal',type=Path)
     p.add_argument('--serial',default='127.0.0.1:16416')
@@ -46,7 +48,8 @@ def main():
             print(row, file=stream, flush=True)
             if event in {'ready', 'armed', 'first_observation', 'complete', 'unavailable', 'ended'}:
                 print(row, flush=True)
-        log('ready',reader='NullsAI/native_runner',mode='observe' if args.observe_only else 'play')
+        log('ready',reader='NullsAI/native_runner',mode='observe' if args.observe_only else 'play',
+            placement_input=None if args.observe_only else args.placement_input)
         if args.start_signal:
             while not args.start_signal.exists():
                 if args.log.with_suffix('.STOP').exists():
@@ -139,7 +142,8 @@ def main():
                     actor.step(raw,obs,cursor,log)
                 else:
                     actor.inputs.update(raw,obs)
-            time.sleep(max(0.,.6-(time.monotonic()-start)))
+            interval=.32 if (builder.pending or any(e.position[1]<=21000 for e in enemy)) else .55
+            time.sleep(max(0.,interval-(time.monotonic()-start)))
         log('ended',snapshots=count)
 
 

@@ -26,10 +26,14 @@ class AdbTouchController:
         layout: TouchLayout,
         *,
         rng: random.Random | None = None,
+        placement_input: str = "swipe",
     ) -> None:
         self.command = [str(adb), "-s", serial]
         self.layout = layout
         self.rng = rng or random.SystemRandom()
+        if placement_input not in {"drag", "tap", "swipe"}:
+            raise ValueError(f"unknown placement input {placement_input!r}")
+        self.placement_input = placement_input
 
     def _run(self, *args: str) -> str:
         result = subprocess.run(self.command + list(args), capture_output=True, text=True, timeout=15)
@@ -75,6 +79,32 @@ class AdbTouchController:
             str(duration_ms),
         )
 
+    def _place_exact(self, hand: tuple[int, int], target: tuple[int, int]) -> None:
+        hx, hy = hand
+        x, y = target
+        if not (0 <= x < self.layout.screen_width and 0 <= y < self.layout.screen_height):
+            raise LiveLadderError("placement falls outside the Android surface")
+        if self.placement_input == "tap":
+            self._run("shell", f"input touchscreen tap {hx} {hy} && sleep 0.05 && input touchscreen tap {x} {y}")
+            return
+
+        motion = "input touchscreen motionevent"
+        commands = (
+            f"{motion} DOWN {hx} {hy}",
+            f"{motion} MOVE {(hx + x) // 2} {(hy + y) // 2}",
+            f"{motion} MOVE {x} {y}",
+            "sleep 0.06",
+            f"{motion} UP {x} {y}",
+        )
+        try:
+            self._run("shell", " && ".join(commands))
+        except (LiveLadderError, OSError, subprocess.TimeoutExpired):
+            try:
+                self._run("shell", "input", "touchscreen", "motionevent", "CANCEL", str(x), str(y))
+            except (LiveLadderError, OSError, subprocess.TimeoutExpired):
+                pass
+            raise
+
     def execute(self, actions: Sequence[ActionV1]) -> None:
         started = time.monotonic()
         for action in actions:
@@ -87,6 +117,9 @@ class AdbTouchController:
             if remaining > 0:
                 time.sleep(remaining)
             hand_center = (round(self.layout.hand_centers_x[action.hand_slot]), round(self.layout.hand_y))
+            if self.placement_input != "swipe":
+                self._place_exact(hand_center, self.layout.target_pixel(action))
+                continue
             start = self._jitter(hand_center, self.layout.hand_jitter_px)
             target = self.layout.target_pixel(action)
             if action.subcell_offset is None:

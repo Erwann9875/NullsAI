@@ -349,14 +349,17 @@ class BattleLayoutDiscoveryMixin(LocalWorldIndex):
         self.layout = None
         hint = getattr(self, "_clock_hint", None)
         if hint:
+            attempts = getattr(self, "_quick_hint_attempts", 0)
+            self._quick_hint_attempts = attempts + 1
             try:
-                self.layout = self._cached_layout(*hint, quick=quick)
+                self.layout = self._cached_layout(*hint, quick=quick and attempts % 4 != 3)
             except ExternalMemoryError as error:
                 if str(error) != "read range is not contained in a readable mapping":
                     raise
         if self.layout is None:
             self.layout = self._uncached_layout(quick=quick)
         self._clock_hint = (self.layout.manager, self.layout.world)
+        self._quick_hint_attempts = 0
         self.generation += 1
         self.public_state = PublicBattleSnapshot(self.card_costs)
         return self.layout

@@ -30,4 +30,6 @@ $device = @('--firstlight', 'D:/FirstLight', '--player-tag', 'YOUR_PLAYER_TAG', 
 
 Start the match in-game when the terminal prints `ready`. The runner waits for a moving battle clock and verifies the local account and deck before playing. The `armed` event reports attachment time in milliseconds. The first observation reports the time from that lookup to a usable board. Lobby waiting is reported separately. Decisions record the observed threat, its position, the intended placement, and inference time. A confirmed receipt means the game accepted the play.
 
+By default the runner drags the card from its hand slot to the exact tile center, holds it there for 60 ms, then releases. Use `--placement-input tap` for separate hand and tile taps. Each `touch_sent` event records the grid cell and time spent sending the gesture. For troops and buildings, `deployment_observed` records their first visible position. Moving units and multi-unit formations can appear away from the selected center. The receipt includes the tick of the decision that submitted it.
+
 Add `--observe-only` to read the match without loading the policy or submitting plays. Use `--adb` to select an ADB executable. Create `.runtime/match-01.STOP` to stop this run.

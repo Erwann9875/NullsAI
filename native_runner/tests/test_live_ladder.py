@@ -209,6 +209,48 @@ def test_touch_controller_drags_from_hand_to_exact_subcell_target() -> None:
     )
 
 
+def test_tap_placement_selects_the_live_slot_and_exact_board_coordinate():
+    layout = TouchLayout(900, 1600, 75, 160, 825, 1200, 1425, (282, 451, 619, 787))
+    controller = AdbTouchController(Path("adb"), "test", layout, placement_input="tap")
+    action = ActionV1.play(owner=0, hand_slot=2, grid=(4, 12), card_id=HOG_26_DECK[4])
+    x, y = layout.target_pixel(action)
+    with patch.object(controller, "_run") as send:
+        controller.execute((action,))
+    send.assert_called_once_with("shell", f"input touchscreen tap 619 1425 && sleep 0.05 && input touchscreen tap {x} {y}")
+
+
+def test_fast_drag_keeps_contact_until_release_at_the_exact_target():
+    layout = TouchLayout(900, 1600, 75, 160, 825, 1200, 1425, (282, 451, 619, 787))
+    controller = AdbTouchController(Path("adb"), "test", layout, placement_input="drag")
+    action = ActionV1.play(owner=0, hand_slot=3, grid=(15, 22), card_id=HOG_26_DECK[4],
+                           subcell_offset=(0.2, -0.25))
+    x, y = layout.target_pixel(action)
+    with patch.object(controller, "_run") as send:
+        controller.execute((action,))
+    send.assert_called_once()
+    shell, gesture = send.call_args.args
+    assert shell == "shell"
+    assert gesture.split(" && ") == [
+        "input touchscreen motionevent DOWN 787 1425",
+        f"input touchscreen motionevent MOVE {(787 + x) // 2} {(1425 + y) // 2}",
+        f"input touchscreen motionevent MOVE {x} {y}",
+        "sleep 0.06",
+        f"input touchscreen motionevent UP {x} {y}",
+    ]
+
+
+def test_interrupted_drag_cancels_contact_without_replaying_the_play():
+    layout = TouchLayout(900, 1600, 75, 160, 825, 1200, 1425, (282, 451, 619, 787))
+    controller = AdbTouchController(Path("adb"), "test", layout, placement_input="drag")
+    action = ActionV1.play(owner=0, hand_slot=0, grid=(4, 12), card_id=HOG_26_DECK[0])
+    x, y = layout.target_pixel(action)
+    with patch.object(controller, "_run", side_effect=[LiveLadderError("gesture failed"), ""]) as send:
+        with pytest.raises(LiveLadderError, match="gesture failed"):
+            controller.execute((action,))
+    assert send.call_count == 2
+    assert send.call_args.args == ("shell", "input", "touchscreen", "motionevent", "CANCEL", str(x), str(y))
+
+
 def test_touch_controller_bounds_release_jitter_inside_selected_tile() -> None:
     layout = TouchLayout(
         screen_width=900,
