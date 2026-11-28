@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import hashlib
 from pathlib import Path
 import re
 import socket
@@ -9,7 +8,8 @@ import subprocess
 import time
 from typing import Callable, Mapping
 
-from .live_settings import (
+from .live_contracts import LiveLadderError, sha256_file
+from .game_profile import (
     DEFAULT_READER_PORT,
     EXPECTED_PROTOCOL,
     EXPECTED_READER_SHA256,
@@ -39,14 +39,6 @@ class ExternalSourceError(RuntimeError):
     pass
 
 
-def _sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
 @dataclass(frozen=True, slots=True)
 class ExternalAttestation:
     pid: int
@@ -58,7 +50,6 @@ class ExternalAttestation:
 
 
 class AdbExternalReaderRuntime:
-
     def __init__(
         self,
         *,
@@ -117,7 +108,7 @@ class AdbExternalReaderRuntime:
     def _reader_hash(self) -> str:
         if not self.reader_binary.is_file():
             raise ExternalSourceError(f"reader binary is missing: {self.reader_binary}")
-        digest = _sha256(self.reader_binary)
+        digest = sha256_file(self.reader_binary)
         if digest != EXPECTED_READER_SHA256:
             raise ExternalSourceError(f"reader SHA-256 is {digest}, expected {EXPECTED_READER_SHA256}")
         return digest
@@ -227,7 +218,6 @@ class AdbExternalReaderRuntime:
 
 
 class ExternalLiveClient:
-
     def __init__(
         self,
         runtime: AdbExternalReaderRuntime,
@@ -283,3 +273,23 @@ class ExternalLiveClient:
         if self.reader.layout is None:
             raise ExternalSourceError("external live client is not armed")
         return self.reader.snapshot(int(event_cursor))
+
+
+def _observe_with_snapshot_retry(
+    client: ExternalLiveClient,
+    event_cursor: int,
+    *,
+    attempts: int = 40,
+) -> dict[str, object]:
+    if attempts < 1:
+        raise ValueError("snapshot attempts must be positive")
+    last_error: ExternalMemoryError | None = None
+    for _attempt in range(attempts):
+        try:
+            return client.observe(event_cursor)
+        except ExternalMemoryError as error:
+            last_error = error
+            time.sleep(0.01)
+    raise LiveLadderError(
+        f"live memory stayed inconsistent across {attempts} consecutive snapshot retries"
+    ) from last_error

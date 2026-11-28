@@ -3,22 +3,18 @@ from __future__ import annotations
 from dataclasses import replace
 import struct
 import time
-from typing import Iterable, Sequence
+from typing import Sequence
 
-import numpy as np
-
+from .public_snapshot import PublicBattleSnapshot
 from .memory_types import (
     DECK_SLOT_VECTOR,
     HOG_26_SET,
     MANAGER_TICK,
     MANAGER_WORLD,
-    MAX_TRANSFER,
-    MAX_WORLD_CANDIDATES,
     ROOT_CYCLE_VECTOR,
     ROOT_ELIXIR,
     ROOT_HAND_VECTOR,
     ROOT_OBJECT_MANAGER,
-    SCAN_OVERLAP,
     WORLD_FINALIZED,
     WORLD_LOCAL_DECK,
     WORLD_LOCAL_IDENTITY,
@@ -29,7 +25,6 @@ from .memory_types import (
     WORLD_RESULT,
     BattleLayout,
     ExternalMemoryError,
-    ProcessMapping,
     _i32,
     _u64,
     _vector,
@@ -57,78 +52,6 @@ class BattleLayoutDiscoveryMixin:
             mapping.readable and (not writable or mapping.writable) and mapping.contains(address, size)
             for mapping in self.maps
         )
-
-    def _heap_maps(self) -> tuple[ProcessMapping, ...]:
-        result = tuple(
-            mapping
-            for mapping in self.maps
-            if mapping.readable
-            and mapping.writable
-            and mapping.name in {"[anon:scudo:primary]", "[anon:scudo:secondary]"}
-        )
-        if not result:
-            raise ExternalMemoryError("MuMu exposes no readable native scudo heap")
-        return result
-
-    def _chunks(self, mappings: Iterable[ProcessMapping]) -> Iterable[tuple[int, bytes]]:
-        step = MAX_TRANSFER - SCAN_OVERLAP
-        for mapping in mappings:
-            cursor = mapping.start
-            while cursor < mapping.end:
-                size = min(MAX_TRANSFER, mapping.end - cursor)
-                try:
-                    payload = self.memory.read(cursor, size)
-                except ExternalMemoryError as error:
-                    if str(error) != "read range is not contained in a readable mapping":
-                        raise
-
-
-                    break
-                yield cursor, payload
-                if cursor + size >= mapping.end:
-                    break
-                cursor += step
-
-    def _world_candidates(self) -> tuple[int, ...]:
-        heap = self._heap_maps()
-        heap_starts = np.asarray([mapping.start for mapping in heap], dtype=np.uint64)
-        heap_ends = np.asarray([mapping.end for mapping in heap], dtype=np.uint64)
-        found: set[int] = set()
-        primary = tuple(mapping for mapping in heap if mapping.name.endswith(":primary]"))
-        phases = (primary, tuple(mapping for mapping in heap if mapping not in primary))
-        for phase in phases:
-            for address, payload in self._chunks(phase):
-                payload = payload[: len(payload) - len(payload) % 8]
-                words = np.frombuffer(payload, dtype="<u8")
-                count = len(words) - 61
-                if count <= 0:
-                    continue
-                intervals = np.searchsorted(heap_starts, words, side="right") - 1
-                safe_intervals = np.maximum(intervals, 0)
-                pointers = (intervals >= 0) & (words < heap_ends[safe_intervals])
-                mask = (
-                    pointers[6 : 6 + count]
-                    & pointers[7 : 7 + count]
-                    & pointers[17 : 17 + count]
-                    & pointers[18 : 18 + count]
-                    & pointers[28 : 28 + count]
-                    & pointers[29 : 29 + count]
-                )
-                mask &= words[6 : 6 + count] != words[7 : 7 + count]
-                mask &= words[17 : 17 + count] != words[18 : 18 + count]
-                mask &= words[28 : 28 + count] != words[29 : 29 + count]
-                world_state = words[3 : 3 + count] & np.uint64(0xFFFF_FFFF)
-                result_raw = words[55 : 55 + count] & np.uint64(0xFFFF_FFFF)
-                finalized = words[60 : 60 + count] & np.uint64(0xFF)
-                mask &= world_state <= 16
-                mask &= np.isin(result_raw, np.asarray((0, 1, 0xFFFF_FFFF), dtype=np.uint64))
-                mask &= finalized <= 1
-                aligned = ((address + np.arange(count, dtype=np.uint64) * 8) & 0xF) == 0
-                for index in np.flatnonzero(mask & aligned):
-                    found.add(address + int(index) * 8)
-                    if len(found) > MAX_WORLD_CANDIDATES:
-                        raise ExternalMemoryError("native world scan exceeded its candidate bound")
-        return tuple(sorted(found))
 
     def _manager_candidates(self) -> tuple[tuple[int, int], ...]:
 
@@ -310,57 +233,6 @@ class BattleLayoutDiscoveryMixin:
         }
         return report
 
-    def _validate_worlds(self, candidates: Sequence[int]) -> tuple[BattleLayout, ...]:
-
-        valid: list[BattleLayout] = []
-        for world in candidates:
-            layout = self._validate_world(world)
-            if layout is not None:
-                valid.append(layout)
-        return tuple(valid)
-
-    def _pointer_occurrences(self, value: int) -> tuple[int, ...]:
-        needle = struct.pack("<Q", value)
-        found: set[int] = set()
-        for address, payload in self._chunks(self._heap_maps()):
-            cursor = 0
-            while True:
-                index = payload.find(needle, cursor)
-                if index < 0:
-                    break
-                location = address + index
-                if location % 8 == 0:
-                    found.add(location)
-                cursor = index + 1
-        return tuple(sorted(found))
-
-    def _manager_for_world(self, world: int) -> int | None:
-        candidates: list[tuple[int, int]] = []
-        for occurrence in self._pointer_occurrences(world):
-            manager = occurrence - MANAGER_WORLD
-            if manager <= 0 or manager % 8 != 0 or not self._mapped(manager, 0xB0):
-                continue
-            data = self.memory.read(manager, 0xB0)
-            tick = _i32(data, MANAGER_TICK)
-            if _u64(data, MANAGER_WORLD) == world and 0 <= tick <= 200_000:
-                candidates.append((manager, tick))
-        if not candidates:
-            return None
-        time.sleep(0.12)
-        advancing: list[int] = []
-        stable: list[int] = []
-        for manager, previous_tick in candidates:
-            data = self.memory.read(manager, 0xB0)
-            tick = _i32(data, MANAGER_TICK)
-            if _u64(data, MANAGER_WORLD) != world or not previous_tick <= tick <= previous_tick + 20:
-                continue
-            (advancing if tick > previous_tick else stable).append(manager)
-        if len(advancing) == 1:
-            return advancing[0]
-        if not advancing and len(stable) == 1:
-            return stable[0]
-        return None
-
     def discover(self) -> BattleLayout:
         manager, world = self.discover_manager_world()
         validated = self._validate_world(world)
@@ -368,9 +240,5 @@ class BattleLayoutDiscoveryMixin:
             raise ExternalMemoryError("active GameState world does not match the attested Hog 2.6 layout")
         self.layout = replace(validated, manager=manager)
         self.generation += 1
-        self.sequence = 0
-        self.events.clear()
-        self.event_sequence = 0
-        self.seen_objects.clear()
-        self.previous_hand = ()
+        self.public_state = PublicBattleSnapshot(self.card_costs)
         return self.layout

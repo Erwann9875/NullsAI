@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from datetime import datetime
+import json
 from pathlib import Path
 import random
 from types import SimpleNamespace
@@ -10,7 +11,6 @@ from unittest.mock import Mock, patch
 import pytest
 
 from native_runner.live_probe.live_ladder import (
-    AUTHORIZATION_END_EPOCH_EXCLUSIVE,
     HOG_26_DECK,
     LiveLadderError,
     LiveObservationBuilder,
@@ -24,10 +24,18 @@ from native_runner.live_probe.live_ladder import (
     validate_fair_payload,
     validate_touch_actions,
 )
-from native_runner.live_probe import live_ladder
+from native_runner.tests.live_fixtures import battle_payload
+from native_runner.live_probe import live_contracts, live_ladder
 from native_runner.contracts import ActionKind, ActionV1, TargetKind
 from native_runner.training.v4.factory import build_live_tensorizer_v4
 from native_runner.live_probe.external_memory import ExternalMemoryError
+
+
+@pytest.fixture(autouse=True)
+def authorized_clock(monkeypatch):
+    clock = Mock(wraps=datetime)
+    clock.now.side_effect = lambda tz: datetime(2026, 11, 28, 12, tzinfo=tz)
+    monkeypatch.setattr(live_contracts, "datetime", clock)
 
 
 def test_live_device_auto_prefers_cuda_and_falls_back_to_cpu() -> None:
@@ -54,7 +62,7 @@ def test_live_snapshot_retry_recovers_from_a_transient_consistency_race() -> Non
 
 
 def test_startup_grace_requires_no_public_card_play_or_deployed_unit() -> None:
-    pristine = _payload()
+    pristine = battle_payload()
     assert _startup_snapshot_is_pristine(pristine)
 
     with_event = deepcopy(pristine)
@@ -67,75 +75,6 @@ def test_startup_grace_requires_no_public_card_play_or_deployed_unit() -> None:
     assert not _startup_snapshot_is_pristine(with_unit)
 
 
-def _payload() -> dict[str, object]:
-    positions = (
-        (0, 9000, 3000),
-        (0, 3500, 6500),
-        (0, 14500, 6500),
-        (1, 9000, 29000),
-        (1, 3500, 25500),
-        (1, 14500, 25500),
-    )
-    objects = [
-        {
-            "nativeObjectId": index,
-            "owner": owner,
-            "cardId": -1,
-            "dataGlobalId": 35_000_000 if x == 9000 else 35_000_001,
-            "x": x,
-            "y": y,
-            "targetX": x,
-            "targetY": y,
-            "hp": 3000,
-            "maxHp": 3000,
-        }
-        for index, (owner, x, y) in enumerate(positions, 1)
-    ]
-    return {
-        "ok": True,
-        "schema": "nullsroyale-fair-live.v1",
-        "generation": 1,
-        "sequence": 1,
-        "tick": 0,
-        "ended": False,
-        "finalized": False,
-        "worldResultRaw": -1,
-        "localOwner": 0,
-        "authorizationEndUtcExclusive": AUTHORIZATION_END_EPOCH_EXCLUSIVE,
-        "players": [
-            {
-                "owner": 0,
-                "accountId": 123,
-                "crownsRaw": 0,
-                "elixirRaw": 50_000,
-                "elixir": 5.0,
-                "towerTroopId": 159_000_000,
-                "privateStateVisible": True,
-                "hand": list(HOG_26_DECK[:4]),
-                "cycle": list(HOG_26_DECK[4:]),
-                "nextCard": HOG_26_DECK[4],
-                "deck": list(HOG_26_DECK),
-            },
-            {
-                "owner": 1,
-                "crownsRaw": 0,
-                "towerTroopId": 159_000_000,
-                "elixirRaw": None,
-                "elixir": None,
-                "privateStateVisible": False,
-                "hand": [],
-                "cycle": [],
-                "nextCard": None,
-                "deck": [],
-            },
-        ],
-        "objects": objects,
-        "returned": len(objects),
-        "objectsTruncated": False,
-        "eventsTruncated": False,
-        "events": [],
-        "eventCursor": 0,
-    }
 
 
 def test_authorization_window_is_inclusive_through_december_first_paris() -> None:
@@ -146,19 +85,16 @@ def test_authorization_window_is_inclusive_through_december_first_paris() -> Non
 
 
 def test_fair_boundary_rejects_opponent_private_state() -> None:
-    payload = _payload()
+    payload = battle_payload()
     players = payload["players"]
     assert isinstance(players, list)
     players[1]["elixirRaw"] = 60_000
-    with patch("native_runner.live_probe.live_ladder.require_authorization"), pytest.raises(
-        LiveLadderError, match="opponent-private"
-    ):
+    with pytest.raises(LiveLadderError, match="opponent-private"):
         validate_fair_payload(payload)
 
 
 def test_live_builder_tensorizes_unknown_opponent_without_private_fields() -> None:
-    with patch("native_runner.live_probe.live_ladder.require_authorization"):
-        observation = LiveObservationBuilder().build(_payload())
+    observation = LiveObservationBuilder().build(battle_payload())
     enemy = observation.players[1]
     assert enemy.private_state_visible is False
     assert enemy.elixir_exact is None
@@ -271,7 +207,7 @@ def test_touch_controller_bounds_release_jitter_inside_selected_tile() -> None:
 
 
 def test_touch_guard_rejects_a_card_that_does_not_match_the_live_slot() -> None:
-    observation = LiveObservationBuilder().build(_payload())
+    observation = LiveObservationBuilder().build(battle_payload())
     action = ActionV1.play(
         owner=0,
         hand_slot=0,
@@ -284,7 +220,7 @@ def test_touch_guard_rejects_a_card_that_does_not_match_the_live_slot() -> None:
 
 
 def _battle_frame(tick, *, hand=None, elixir=5, events=(), cursor=0, ended=False):
-    raw = _payload()
+    raw = battle_payload()
     raw.update(tick=tick, sequence=tick + 1, events=list(events), eventCursor=cursor, ended=ended)
     own = raw["players"][0]
     own.update(elixirRaw=int(elixir * 10000), elixir=float(elixir))
@@ -314,10 +250,12 @@ def test_policy_loop_submits_legal_followup_before_first_receipt(monkeypatch, tm
         _battle_frame(110, hand=rotated, elixir=4, events=[_event(1, 109, 0, 1)], cursor=1),
         _battle_frame(140, hand=final_hand, elixir=1, events=[_event(2, 138, 1, 4)], cursor=2),
     ))
-    now = [0]
+    current_tick = 0
+
     def snapshot(_cursor):
+        nonlocal current_tick
         frame = next(frames)
-        now[0] = frame["tick"]
+        current_tick = frame["tick"]
         return frame
 
     def decide(obs, **_kwargs):
@@ -337,24 +275,31 @@ def test_policy_loop_submits_legal_followup_before_first_receipt(monkeypatch, tm
     client.observe.side_effect = snapshot
     sent = []
     controller = Mock()
-    controller.execute.side_effect = lambda actions: sent.append((now[0], actions[0].card_id, actions[0].target_grid))
-    monkeypatch.setattr(live_ladder, "require_authorization", lambda: None)
-    monkeypatch.setattr(live_ladder, "_external_runtime", lambda args: Mock())
-    monkeypatch.setattr(live_ladder, "ExternalLiveClient", lambda *a, **kw: client)
+    controller.execute.side_effect = lambda actions: sent.append((current_tick, actions[0].card_id, actions[0].target_grid))
+    runtime = Mock()
+    services = live_ladder.LiveServices(
+        runtime_factory=Mock(return_value=runtime),
+        client_factory=Mock(return_value=client),
+        policy_loader=Mock(return_value=SimpleNamespace(model=None, checkpoint_sha256="test")),
+        session_factory=Mock(return_value=session),
+        touch_controller_factory=Mock(return_value=controller),
+    )
     monkeypatch.setattr(live_ladder, "validate_status", lambda value: value)
-    monkeypatch.setattr(live_ladder, "_arm_until_battle", lambda *a: None)
-    monkeypatch.setattr(live_ladder, "AdbTouchController", lambda *a: controller)
-    monkeypatch.setattr(live_ladder.TouchLayout, "load", lambda path: None)
     monkeypatch.setattr(live_ladder, "_checkpoint", lambda path: path)
-    monkeypatch.setattr(live_ladder, "load_policy_v4", lambda *a, **kw: SimpleNamespace(model=None, checkpoint_sha256="test"))
-    monkeypatch.setattr(live_ladder, "PolicySessionV4", lambda *a, **kw: session)
     log = tmp_path / "decisions.jsonl"
-    args = live_ladder._parser().parse_args(["--adb", "unused", "--serial", "unused", "--account-id", "1", "run",
-                                             "--device", "cpu", "--layout", "unused", "--log", str(log), "--max-plays", "2"])
-    summary = live_ladder.run_policy(args)
+    layout = Path(__file__).resolve().parents[1] / "live_probe" / "mumu_900x1600.json"
+    args = live_ladder._parser().parse_args([
+        "--adb", "unused", "--serial", "unused", "--account-id", "1", "run",
+        "--device", "cpu", "--layout", str(layout), "--log", str(log), "--max-plays", "2",
+    ])
+    summary = live_ladder.run_policy(args, services=services)
 
+    client.disarm.assert_called_once_with()
+    runtime.close.assert_called_once_with()
+    session.end_episode.assert_called_once_with()
     assert sent == [(100, first.card_id, (9, 10)), (105, second.card_id, (4, 12))]
-    receipts = [r for line in log.read_text().splitlines() if (r := live_ladder.json.loads(line)).get("confirmed")]
+    records = (json.loads(line) for line in log.read_text().splitlines())
+    receipts = [record for record in records if record.get("confirmed")]
     assert [(r["requested_tick"], r["confirmed_tick"]) for r in receipts] == [(105, 110), (100, 140)]
     assert summary["plays"] == summary["submitted_plays"] == 2
 
@@ -363,8 +308,7 @@ def test_policy_loop_submits_legal_followup_before_first_receipt(monkeypatch, tm
     ((_play(1), _play(2)), "insufficient elixir"),
     ((_play(0), _play(0)), "distinct hand slots"),
 ])
-def test_invalid_compound_spends_nothing(monkeypatch, actions, reason):
-    monkeypatch.setattr(live_ladder, "require_authorization", lambda: None)
+def test_invalid_compound_spends_nothing(actions, reason):
     builder, controller = LiveObservationBuilder(), Mock()
     dispatcher = LivePlayDispatcher(builder, controller)
     with pytest.raises(LiveLadderError, match=reason):
@@ -373,8 +317,7 @@ def test_invalid_compound_spends_nothing(monkeypatch, actions, reason):
     assert not builder.pending
 
 
-def test_changed_hand_cancels_followup_and_terminal_settles_pending(monkeypatch):
-    monkeypatch.setattr(live_ladder, "require_authorization", lambda: None)
+def test_changed_hand_cancels_followup_and_terminal_settles_pending():
     builder, controller = LiveObservationBuilder(), Mock()
     dispatcher = LivePlayDispatcher(builder, controller)
     dispatcher.submit(builder.build(_battle_frame(100)), 0, (_play(1), _play(0, offset=3)), None)
@@ -385,8 +328,7 @@ def test_changed_hand_cancels_followup_and_terminal_settles_pending(monkeypatch)
     assert dispatcher.submitted == 1 and not builder.pending
 
 
-def test_rotated_slot_uses_current_balance_and_late_event_confirms_once(monkeypatch):
-    monkeypatch.setattr(live_ladder, "require_authorization", lambda: None)
+def test_rotated_slot_uses_current_balance_and_late_event_confirms_once():
     builder, controller = LiveObservationBuilder(), Mock()
     dispatcher = LivePlayDispatcher(builder, controller)
     dispatcher.submit(builder.build(_battle_frame(100, cursor=4)), 4, (_play(1),), None)
@@ -402,7 +344,7 @@ def test_rotated_slot_uses_current_balance_and_late_event_confirms_once(monkeypa
     assert not builder.receipts
 
 
-def test_checkpoint_follows_up_against_an_advancing_push_with_the_first_receipt_outstanding(monkeypatch):
+def test_checkpoint_follows_up_against_an_advancing_push_with_the_first_receipt_outstanding():
     import torch
     from native_runner.training.v4.policy_session import PolicySessionV4, load_policy_v4
 
@@ -413,7 +355,6 @@ def test_checkpoint_follows_up_against_an_advancing_push_with_the_first_receipt_
     torch.set_num_threads(1)
     loaded = load_policy_v4(live_ladder._checkpoint(path), device="cpu", delay_policy="earliest")
     assert loaded.checkpoint_sha256 == live_ladder.EXPECTED_CHECKPOINT_SHA256
-    monkeypatch.setattr(live_ladder, "require_authorization", lambda: None)
     builder = LiveObservationBuilder()
     dispatcher = LivePlayDispatcher(builder, Mock())
     tensorizer = build_live_tensorizer_v4(HOG_26_DECK, actor_owner=0, own_form_availability=(0,) * 8)

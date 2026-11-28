@@ -1,9 +1,8 @@
 from __future__ import annotations
 
-from collections import deque
-from dataclasses import dataclass
 from typing import Mapping
 
+from .public_snapshot import PublicBattleSnapshot
 from .memory_discovery import BattleLayoutDiscoveryMixin
 from .memory_snapshot import BattleSnapshotMixin
 from .memory_transport import ExternalReaderClient, MemoryTransport
@@ -71,9 +70,12 @@ class ExternalBattleReader(BattleLayoutDiscoveryMixin, BattleSnapshotMixin):
         self.libg_base = self._libg_base()
         self.layout: BattleLayout | None = None
         self.generation = 0
-        self.sequence = 0
-        self.event_sequence = 0
-        self.events: deque[dict[str, object]] = deque(maxlen=256)
-        self.seen_objects: set[int] = set()
-        self.previous_hand: tuple[int, ...] = ()
-        self.previous_tower_troops = [0, 0]
+        self.public_state = PublicBattleSnapshot(self.card_costs)
+
+    @property
+    def sequence(self) -> int:
+        return self.public_state.sequence
+
+    @property
+    def event_sequence(self) -> int:
+        return self.public_state.event_sequence

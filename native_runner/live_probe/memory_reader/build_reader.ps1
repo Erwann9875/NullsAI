@@ -28,7 +28,11 @@ $built = Join-Path $targetRoot "x86_64-unknown-linux-musl\release\nullsroyale-me
 if (-not (Test-Path -LiteralPath $built -PathType Leaf)) {
     throw "Cargo did not produce the expected static Linux reader: $built"
 }
+$verification = & $Python (Join-Path $PSScriptRoot "verify_reader.py") $built
+if ($LASTEXITCODE -ne 0) { throw "External reader ELF verification failed." }
+
 New-Item -ItemType Directory -Path (Split-Path -Parent $outputPath) -Force | Out-Null
 Copy-Item -LiteralPath $built -Destination $outputPath -Force
-& $Python (Join-Path $PSScriptRoot "verify_reader.py") $outputPath
-if ($LASTEXITCODE -ne 0) { throw "External reader ELF verification failed." }
+$report = $verification | ConvertFrom-Json
+$report.output = $outputPath
+$report | ConvertTo-Json -Compress
